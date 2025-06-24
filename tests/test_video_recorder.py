@@ -19,7 +19,7 @@ class TestVideoRecorder:
             
     def test_init(self):
         assert self.recorder.output_dir == Path(self.temp_dir)
-        assert self.recorder.fps == 30
+        assert self.recorder.fps == 15
         assert not self.recorder.is_recording
         assert self.recorder.writer is None
         assert self.recorder.recording_thread is None

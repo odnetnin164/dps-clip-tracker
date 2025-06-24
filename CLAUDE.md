@@ -15,6 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Dependencies
 - `pip3 install -r requirements.txt` - Install dependencies (note: NumPy must be <2.0.0 for OpenCV compatibility)
 - `make dev-install` - Install with development dependencies
+- **IMPORTANT**: Always use requirements.txt or Makefile for dependency management. Never install packages directly with pip.
 
 ### Code Quality
 - `make lint` - Check code style with flake8, black, and isort

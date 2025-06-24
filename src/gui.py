@@ -300,18 +300,32 @@ class VideoGridWidget(QWidget):
         media_player.setVideoOutput(video_widget)
         media_player.setSource(QUrl.fromLocalFile(str(video_file)))
         
+        # Track if we've reached the end to prevent reset
+        video_ended = False
+        last_valid_position = 0
+        
         # Set up media player to show first frame and stay on last frame
         def on_media_status_changed(status):
+            nonlocal video_ended
             if status == QMediaPlayer.MediaStatus.LoadedMedia:
                 # Seek to first frame and pause to show it
                 media_player.setPosition(0)
                 media_player.pause()
+                video_ended = False
             elif status == QMediaPlayer.MediaStatus.EndOfMedia:
-                # When video ends, seek to just before the end and pause
-                duration = media_player.duration()
-                if duration > 0:
-                    media_player.setPosition(duration - 1)  # 1ms before end
-                    media_player.pause()
+                # Mark that video has ended
+                video_ended = True
+                
+        def on_position_changed(position):
+            nonlocal video_ended, last_valid_position
+            duration = media_player.duration()
+            
+            # If video ended and position resets to 0, seek back to end
+            if video_ended and position == 0 and duration > 0:
+                media_player.setPosition(duration - 33)  # Go to last frame
+                media_player.pause()
+            elif not video_ended and position > 0:
+                last_valid_position = position
         
         def on_duration_changed(duration):
             if duration > 0:
@@ -320,6 +334,7 @@ class VideoGridWidget(QWidget):
                 self.video_selected.emit("")
         
         media_player.mediaStatusChanged.connect(on_media_status_changed)
+        media_player.positionChanged.connect(on_position_changed)
         media_player.durationChanged.connect(on_duration_changed)
         
         layout.addWidget(video_widget)
