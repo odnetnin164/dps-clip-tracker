@@ -1,9 +1,22 @@
 import time
 import threading
+import os
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
+
+# Global pygame state management
+_pygame_initialized = False
+
+def _ensure_pygame_initialized():
+    """Ensure pygame is initialized exactly once globally."""
+    global _pygame_initialized
+    if not _pygame_initialized and PYGAME_AVAILABLE:
+        pygame.init()
+        pygame.joystick.init()
+        _pygame_initialized = True
+        print("InputHandler: Global pygame initialization complete")
 
 try:
     import pygame
@@ -131,56 +144,96 @@ class GamepadListener(InputListener):
         self.thread: Optional[threading.Thread] = None
         self.callback: Optional[Callable] = None
         self.bound_button: Optional[int] = None
+        self.binding_mode: bool = False
         self.joystick = None
 
-    def set_button_binding(self, button_index: int):
-        self.bound_button = button_index
+    def set_button_binding(self, button_index: Optional[int] = None):
+        if button_index is None:
+            # Enter binding mode - listen for any button press
+            self.binding_mode = True
+            self.bound_button = None
+        else:
+            self.bound_button = button_index
+            self.binding_mode = False
 
     def start_listening(self, callback: Callable[[InputBinding], None]):
         if not PYGAME_AVAILABLE:
             raise RuntimeError("pygame not available for gamepad input")
 
-        # Initialize pygame and joystick subsystem
-        pygame.init()
-        pygame.joystick.init()
+        # Stop any existing listener first
+        self.stop_listening()
+
+        # Enable background joystick events when app is not in focus
+        os.environ['SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS'] = '1'
+
+        # Ensure pygame is initialized globally
+        _ensure_pygame_initialized()
 
         if pygame.joystick.get_count() == 0:
-            raise RuntimeError("No gamepad detected")
+            raise RuntimeError("No gamepad detected. If running in WSL2, controllers may not be accessible. Try running natively on Windows or use USBIPD to forward USB devices to WSL2.")
 
         # Initialize the first joystick
-        self.joystick = pygame.joystick.Joystick(0)
-        self.joystick.init()
+        if not self.joystick:
+            self.joystick = pygame.joystick.Joystick(0)
+            self.joystick.init()
         
         print(f"GamepadListener: Initialized joystick '{self.joystick.get_name()}' with {self.joystick.get_numbuttons()} buttons")
 
         # Set up pygame display (required for joystick events in some cases)
         try:
-            pygame.display.set_mode((1, 1))
-            print("GamepadListener: Created minimal display for event handling")
+            if not pygame.display.get_init():
+                pygame.display.set_mode((1, 1))
+                print("GamepadListener: Created minimal display for event handling")
         except:
             print("GamepadListener: Could not create display, continuing without")
 
         self.callback = callback
         self.running = True
-        self.thread = threading.Thread(target=self._gamepad_loop, daemon=False)
+        self.thread = threading.Thread(target=self._gamepad_loop, daemon=True)
         self.thread.start()
 
     def stop_listening(self):
+        print("GamepadListener: Stopping listener...")
         self.running = False
-        if self.thread:
-            self.thread.join(timeout=1.0)
-            self.thread = None
+        
+        # Don't try to join if we're in the same thread
+        import threading
+        if self.thread and self.thread.is_alive() and threading.current_thread() != self.thread:
+            self.thread.join(timeout=2.0)
+            if self.thread.is_alive():
+                print("GamepadListener: Warning - thread did not stop cleanly")
+        elif self.thread and threading.current_thread() == self.thread:
+            print("GamepadListener: Stopping from within thread, skipping join")
+            
+        self.thread = None
+        
         if self.joystick:
-            self.joystick.quit()
+            try:
+                self.joystick.quit()
+            except:
+                pass
             self.joystick = None
+        # Reset state for next use
+        self.callback = None
+        print("GamepadListener: Stopped and cleaned up")
 
     def _gamepad_loop(self):
-        print(f"GamepadListener: Started monitoring controller, bound_button={self.bound_button}")
+        print(f"GamepadListener: Started monitoring controller, bound_button={self.bound_button}, binding_mode={self.binding_mode}")
+        
+        if not self.joystick:
+            print("GamepadListener: No joystick available, exiting loop")
+            return
+            
         button_states = [False] * self.joystick.get_numbuttons()
 
         try:
             while self.running:
                 try:
+                    # Check if joystick is still connected
+                    if not self.joystick:
+                        print("GamepadListener: Joystick disconnected, exiting loop")
+                        break
+                        
                     # Use direct joystick polling instead of events
                     # This approach is more reliable than pygame events
                     for i in range(self.joystick.get_numbuttons()):
@@ -188,21 +241,42 @@ class GamepadListener(InputListener):
                         
                         # Button press detected (wasn't pressed before, now is)
                         if current_state and not button_states[i]:
-                            print(f"GamepadListener: Button {i} pressed, bound_button={self.bound_button}")
+                            print(f"GamepadListener: Button {i} pressed, bound_button={self.bound_button}, binding_mode={self.binding_mode}")
                             
-                            # Only trigger callback for the bound button
-                            if (
+                            # If in binding mode, bind to the first button pressed
+                            if self.binding_mode:
+                                print(f"GamepadListener: Binding to button {i}")
+                                self.bound_button = i
+                                self.binding_mode = False
+                                if self.callback:
+                                    binding = InputBinding(
+                                        InputType.GAMEPAD, i, f"Controller Button {i}"
+                                    )
+                                    print(f"GamepadListener: Calling binding callback for button {i}")
+                                    try:
+                                        self.callback(binding)
+                                    except Exception as e:
+                                        print(f"GamepadListener: Error in binding callback: {e}")
+                                # After binding, stop the loop to prevent thread join issues
+                                print("GamepadListener: Binding complete, stopping listener")
+                                self.running = False
+                                return
+                            # If not in binding mode, only trigger callback for the bound button
+                            elif (
                                 self.bound_button is not None
                                 and i == self.bound_button
                                 and self.callback
                             ):
-                                print(f"GamepadListener: Triggering callback for button {i}")
+                                print(f"GamepadListener: Triggering callback for bound button {i}")
                                 binding = InputBinding(
                                     InputType.GAMEPAD, i, f"Controller Button {i}"
                                 )
-                                self.callback(binding)
+                                try:
+                                    self.callback(binding)
+                                except Exception as e:
+                                    print(f"GamepadListener: Error in monitoring callback: {e}")
                             else:
-                                print(f"GamepadListener: Not triggering - bound_button={self.bound_button}, callback={self.callback is not None}")
+                                print(f"GamepadListener: Button {i} pressed but not bound (bound_button={self.bound_button})")
                         
                         button_states[i] = current_state
 
@@ -238,17 +312,25 @@ class InputHandler:
 
     def bind_input(self, input_type: InputType, key_code: Any) -> InputBinding:
         print(f"InputHandler: Binding input - type={input_type}, key_code={key_code}")
+        
+        # Stop all existing listeners first
+        print(f"InputHandler: Stopping {len(self.listeners)} existing listeners")
+        for listener_type, listener in list(self.listeners.items()):
+            print(f"InputHandler: Stopping {listener_type} listener")
+            try:
+                listener.stop_listening()
+            except Exception as e:
+                print(f"InputHandler: Error stopping {listener_type} listener: {e}")
+        self.listeners.clear()
+        
+        # Small delay to ensure cleanup is complete
+        import time
+        time.sleep(0.1)
+        
         binding = InputBinding(
             input_type, key_code, self._get_display_name(input_type, key_code)
         )
         self.current_binding = binding
-
-        # Stop all existing listeners first
-        print(f"InputHandler: Stopping {len(self.listeners)} existing listeners")
-        for listener_type, listener in self.listeners.items():
-            print(f"InputHandler: Stopping {listener_type} listener")
-            listener.stop_listening()
-        self.listeners.clear()
 
         # Create and configure the new listener
         if input_type == InputType.KEYBOARD:
@@ -262,6 +344,7 @@ class InputHandler:
         elif input_type == InputType.GAMEPAD:
             print("InputHandler: Creating gamepad listener")
             self.set_gamepad_listener()
+            # For gamepad, key_code is the button index
             self.listeners[InputType.GAMEPAD].set_button_binding(key_code)
             print(f"InputHandler: Gamepad listener created and bound to button {key_code}")
 
@@ -325,3 +408,40 @@ class InputHandler:
             return f"Controller Button {key_code}"
         else:
             return str(key_code)
+
+    def detect_and_bind_gamepad_button(self, callback: Callable[[InputBinding], None]) -> bool:
+        """
+        Start listening for any gamepad button press for binding purposes.
+        Returns True if gamepad detection started successfully, False otherwise.
+        This replaces the GUI's own gamepad binding loop.
+        """
+        if not PYGAME_AVAILABLE:
+            return False
+            
+        try:
+            # Stop any existing listeners
+            self.stop_monitoring()
+            
+            # Set up gamepad listener in binding mode
+            self.set_gamepad_listener()
+            gamepad_listener = self.listeners[InputType.GAMEPAD]
+            gamepad_listener.set_button_binding(None)  # Enter binding mode
+            
+            # Start listening with the provided callback
+            gamepad_listener.start_listening(callback)
+            return True
+            
+        except Exception as e:
+            print(f"InputHandler: Error starting gamepad binding detection: {e}")
+            return False
+            
+    def stop_gamepad_binding_detection(self):
+        """Stop gamepad binding detection."""
+        if InputType.GAMEPAD in self.listeners:
+            try:
+                self.listeners[InputType.GAMEPAD].stop_listening()
+            except Exception as e:
+                print(f"InputHandler: Error stopping gamepad binding detection: {e}")
+            finally:
+                # Always remove the listener from the dict
+                del self.listeners[InputType.GAMEPAD]

@@ -25,7 +25,6 @@ class KeyBindingWidget(QWidget):
         super().__init__(parent)
         self.current_binding: Optional[InputBinding] = None
         self.temp_listener = None
-        self.gamepad_thread = None
         self.is_binding = False
         self.selected_input_type = InputType.KEYBOARD  # Default to keyboard
         
@@ -98,49 +97,32 @@ class KeyBindingWidget(QWidget):
     
     def _start_gamepad_binding(self):
         try:
-            import pygame
-            import threading
-            import time
+            # Import InputHandler to use for gamepad detection
+            from .input_handler import InputHandler
             
-            pygame.init()
-            pygame.joystick.init()
+            # Create temporary input handler for binding detection
+            if not hasattr(self, 'temp_input_handler'):
+                self.temp_input_handler = InputHandler()
             
-            if pygame.joystick.get_count() == 0:
-                raise RuntimeError("No gamepad detected")
+            # Start gamepad binding detection
+            success = self.temp_input_handler.detect_and_bind_gamepad_button(
+                self._on_gamepad_button_detected
+            )
             
-            # Start gamepad listening thread
-            self.gamepad_thread = threading.Thread(target=self._gamepad_binding_loop)
-            self.gamepad_thread.daemon = True
-            self.gamepad_thread.start()
-            
-        except ImportError:
-            raise RuntimeError("pygame not available for gamepad input")
+            if not success:
+                raise RuntimeError("Failed to start gamepad detection")
+                
+        except Exception as e:
+            raise RuntimeError(f"Gamepad binding failed: {str(e)}")
     
-    def _gamepad_binding_loop(self):
-        import pygame
-        import time
-        
-        joystick = pygame.joystick.Joystick(0)
-        joystick.init()
-        
-        button_states = [False] * joystick.get_numbuttons()
-        
-        while self.is_binding:
-            pygame.event.pump()
+    def _on_gamepad_button_detected(self, binding):
+        """Called when a gamepad button is detected during binding"""
+        # Stop the temporary detection
+        if hasattr(self, 'temp_input_handler'):
+            self.temp_input_handler.stop_gamepad_binding_detection()
             
-            for i in range(joystick.get_numbuttons()):
-                current_state = joystick.get_button(i)
-                
-                # If button is pressed (and wasn't pressed before)
-                if current_state and not button_states[i]:
-                    binding = InputBinding(InputType.GAMEPAD, i, f"Controller Button {i}")
-                    # Emit signal to main thread
-                    self.gamepad_binding_detected.emit(binding)
-                    return
-                    
-                button_states[i] = current_state
-                
-            time.sleep(0.01)
+        # Emit the binding signal to the main thread
+        self.gamepad_binding_detected.emit(binding)
     
     def _on_key_captured(self, key):
         display_name = self._get_key_display_name(key)
@@ -155,6 +137,9 @@ class KeyBindingWidget(QWidget):
     
     def _on_binding_captured(self, binding: InputBinding):
         self._stop_temp_listener()
+        # Small delay to ensure cleanup is complete
+        import time
+        time.sleep(0.1)
         self.set_binding(binding)
     
     def _stop_temp_listener(self):
@@ -162,14 +147,12 @@ class KeyBindingWidget(QWidget):
             self.temp_listener.stop()
             self.temp_listener = None
         
-        # Stop gamepad thread if it's running
-        if hasattr(self, 'gamepad_thread') and self.gamepad_thread and self.gamepad_thread.is_alive():
-            self.is_binding = False  # This will cause the gamepad loop to exit
-            # Only join if we're not in the gamepad thread itself
-            import threading
-            if threading.current_thread() != self.gamepad_thread:
-                self.gamepad_thread.join(timeout=1.0)  # Wait up to 1 second
-            self.gamepad_thread = None
+        # Stop temporary input handler for gamepad binding
+        if hasattr(self, 'temp_input_handler'):
+            print("KeyBindingWidget: Stopping gamepad binding detection...")
+            self.temp_input_handler.stop_gamepad_binding_detection()
+            self.temp_input_handler = None
+            print("KeyBindingWidget: Gamepad binding detection stopped")
     
     def _reset_binding_state(self):
         self._stop_temp_listener()

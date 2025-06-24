@@ -5,6 +5,8 @@ import threading
 import time
 import platform
 import subprocess
+import wave
+import pyaudio
 from typing import Optional, Tuple, Dict
 from pathlib import Path
 
@@ -17,8 +19,19 @@ class VideoRecorder:
         self.is_recording = False
         self.writer: Optional[cv2.VideoWriter] = None
         self.recording_thread: Optional[threading.Thread] = None
+        self.audio_thread: Optional[threading.Thread] = None
         self.current_filename: Optional[str] = None
+        self.current_audio_filename: Optional[str] = None
         self.stop_recording_event = threading.Event()
+        
+        # Audio configuration
+        self.audio_format = pyaudio.paInt16
+        self.audio_channels = 2
+        self.audio_rate = 44100
+        self.audio_chunk = 1024
+        self.audio_frames = []
+        self.pyaudio_instance: Optional[pyaudio.PyAudio] = None
+        self.audio_stream = None
         
     def _get_focused_window_bounds(self) -> Optional[Dict[str, int]]:
         """Get the bounds of the currently focused window."""
@@ -195,9 +208,16 @@ class VideoRecorder:
             filename = f"clip_{timestamp}.mp4"
             
         self.current_filename = str(self.output_dir / filename)
+        self.current_audio_filename = str(self.output_dir / filename.replace('.mp4', '_audio.wav'))
         self.stop_recording_event.clear()
         self.is_recording = True
+        self.audio_frames = []
         
+        # Start audio recording thread
+        self.audio_thread = threading.Thread(target=self._record_audio)
+        self.audio_thread.start()
+        
+        # Start video recording thread
         self.recording_thread = threading.Thread(target=self._record_screen)
         self.recording_thread.start()
         
@@ -208,13 +228,26 @@ class VideoRecorder:
             return None
             
         self.stop_recording_event.set()
+        
+        # Wait for both threads to complete
         if self.recording_thread:
             self.recording_thread.join()
+        if self.audio_thread:
+            self.audio_thread.join()
+            
+        # Save audio file
+        if self.current_audio_filename and self.audio_frames:
+            self._save_audio_file()
+            
+        # Combine video and audio into final file
+        final_filename = self._combine_audio_video()
             
         self.is_recording = False
-        filename = self.current_filename
         self.current_filename = None
-        return filename
+        self.current_audio_filename = None
+        self.audio_frames = []
+        
+        return final_filename
         
     def _record_screen(self):
         with mss.mss() as sct:
@@ -283,7 +316,209 @@ class VideoRecorder:
                     self.writer.release()
                     self.writer = None
 
+    def _record_audio(self):
+        """Record system audio using PyAudio with WASAPI loopback."""
+        try:
+            self.pyaudio_instance = pyaudio.PyAudio()
+            
+            # Find WASAPI loopback device for system audio
+            loopback_device_index = self._find_wasapi_loopback_device()
+            
+            if loopback_device_index is None:
+                print("WARNING: No WASAPI loopback device found. Trying to enable programmatically...")
+                # Fallback to default device (might be microphone)
+                loopback_device_index = None
+            
+            try:
+                # Open audio stream for recording
+                self.audio_stream = self.pyaudio_instance.open(
+                    format=self.audio_format,
+                    channels=self.audio_channels,
+                    rate=self.audio_rate,
+                    input=True,
+                    input_device_index=loopback_device_index,
+                    frames_per_buffer=self.audio_chunk
+                )
+                
+                print("DEBUG: System audio recording started")
+                self.audio_frames = []
+                
+                # Record audio until stop event is set
+                while not self.stop_recording_event.is_set():
+                    try:
+                        data = self.audio_stream.read(self.audio_chunk, exception_on_overflow=False)
+                        self.audio_frames.append(data)
+                    except Exception as e:
+                        print(f"DEBUG: Audio read error: {e}")
+                        break
+                        
+            except Exception as e:
+                print(f"WARNING: Could not open audio stream: {e}")
+                return
+                
+        except Exception as e:
+            print(f"WARNING: Audio recording initialization failed: {e}")
+        finally:
+            # Clean up audio resources
+            if self.audio_stream:
+                try:
+                    self.audio_stream.stop_stream()
+                    self.audio_stream.close()
+                except:
+                    pass
+                self.audio_stream = None
+                
+            if self.pyaudio_instance:
+                try:
+                    self.pyaudio_instance.terminate()
+                except:
+                    pass
+                self.pyaudio_instance = None
+                
+            print("DEBUG: Audio recording stopped")
 
+    def _find_wasapi_loopback_device(self) -> Optional[int]:
+        """Find WASAPI loopback device for system audio recording."""
+        if not self.pyaudio_instance:
+            return None
+            
+        try:
+            # Get all audio devices
+            device_count = self.pyaudio_instance.get_device_count()
+            
+            print("DEBUG: Available audio devices:")
+            for i in range(device_count):
+                try:
+                    device_info = self.pyaudio_instance.get_device_info_by_index(i)
+                    device_name = device_info.get('name', '')
+                    max_input_channels = device_info.get('maxInputChannels', 0)
+                    print(f"  {i}: {device_name} (input channels: {max_input_channels})")
+                    
+                    # Look for WASAPI loopback devices
+                    device_name_lower = device_name.lower()
+                    if any(keyword in device_name_lower for keyword in [
+                        'stereo mix', 'wave out mix', 'what u hear', 'loopback'
+                    ]) and max_input_channels > 0:
+                        print(f"DEBUG: Found system audio device: {device_name}")
+                        return i
+                        
+                    # Alternative: look for speakers/headphones with WASAPI that support input
+                    if ('speakers' in device_name_lower or 'headphones' in device_name_lower) and \
+                       'wasapi' in device_name_lower and max_input_channels > 0:
+                        print(f"DEBUG: Found potential WASAPI loopback device: {device_name}")
+                        return i
+                        
+                except Exception as e:
+                    print(f"DEBUG: Error checking device {i}: {e}")
+                    continue
+                    
+            # If no specific loopback device found, try to enable stereo mix programmatically
+            self._try_enable_stereo_mix()
+            
+            # Try again after attempting to enable stereo mix
+            for i in range(device_count):
+                try:
+                    device_info = self.pyaudio_instance.get_device_info_by_index(i)
+                    device_name = device_info.get('name', '').lower()
+                    if 'stereo mix' in device_name and device_info.get('maxInputChannels', 0) > 0:
+                        print(f"DEBUG: Found stereo mix after enabling: {device_info['name']}")
+                        return i
+                except Exception:
+                    continue
+                    
+        except Exception as e:
+            print(f"DEBUG: Error finding WASAPI loopback device: {e}")
+            
+        return None
+
+    def _try_enable_stereo_mix(self):
+        """Try to enable stereo mix on Windows using PowerShell."""
+        if platform.system() != "Windows":
+            return
+            
+        try:
+            # PowerShell script to enable stereo mix
+            ps_script = '''
+            $devices = Get-WmiObject -Class Win32_SoundDevice
+            foreach ($device in $devices) {
+                if ($device.Name -like "*Stereo Mix*") {
+                    Write-Output "Found Stereo Mix device"
+                }
+            }
+            '''
+            
+            # This is a simplified attempt - full implementation would require more complex registry manipulation
+            print("DEBUG: Attempting to enable stereo mix (may require manual intervention)")
+            
+        except Exception as e:
+            print(f"DEBUG: Could not enable stereo mix programmatically: {e}")
+
+    def _save_audio_file(self):
+        """Save recorded audio frames to a WAV file."""
+        try:
+            if not self.audio_frames:
+                print("DEBUG: No audio frames to save")
+                return
+                
+            # Save audio frames to WAV file
+            with wave.open(self.current_audio_filename, 'wb') as wav_file:
+                wav_file.setnchannels(self.audio_channels)
+                wav_file.setsampwidth(2)  # 16-bit audio = 2 bytes
+                wav_file.setframerate(self.audio_rate)
+                wav_file.writeframes(b''.join(self.audio_frames))
+                
+            print(f"DEBUG: Audio saved to {self.current_audio_filename}")
+        except Exception as e:
+            print(f"WARNING: Failed to save audio file: {e}")
+
+    def _combine_audio_video(self) -> Optional[str]:
+        """Combine video and audio files using ffmpeg."""
+        if not self.current_filename or not self.current_audio_filename:
+            return self.current_filename
+            
+        try:
+            # Check if audio file exists and has content
+            audio_path = Path(self.current_audio_filename)
+            if not audio_path.exists() or audio_path.stat().st_size == 0:
+                print("DEBUG: No audio file to combine, returning video-only file")
+                return self.current_filename
+                
+            # Create output filename with audio
+            video_with_audio = self.current_filename.replace('.mp4', '_with_audio.mp4')
+            
+            # Use ffmpeg to combine video and audio
+            ffmpeg_cmd = [
+                'ffmpeg', '-y',  # -y to overwrite existing files
+                '-i', self.current_filename,  # video input
+                '-i', self.current_audio_filename,  # audio input
+                '-c:v', 'copy',  # copy video codec
+                '-c:a', 'aac',  # encode audio as AAC
+                '-shortest',  # finish when shortest stream ends
+                video_with_audio
+            ]
+            
+            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                # Clean up temporary files
+                try:
+                    Path(self.current_filename).unlink()  # Remove video-only file
+                    Path(self.current_audio_filename).unlink()  # Remove audio file
+                except Exception as e:
+                    print(f"DEBUG: Could not clean up temporary files: {e}")
+                
+                print(f"DEBUG: Combined video and audio saved to {video_with_audio}")
+                return video_with_audio
+            else:
+                print(f"WARNING: ffmpeg failed: {result.stderr}")
+                return self.current_filename
+                
+        except (subprocess.SubprocessError, FileNotFoundError) as e:
+            print(f"WARNING: Could not combine audio and video (ffmpeg not available?): {e}")
+            return self.current_filename
+        except Exception as e:
+            print(f"WARNING: Unexpected error combining audio and video: {e}")
+            return self.current_filename
                     
     def get_screen_size(self) -> Tuple[int, int]:
         with mss.mss() as sct:

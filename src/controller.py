@@ -79,7 +79,10 @@ class ClipRecorderController(QObject):
     def _on_input_triggered(self, binding: InputBinding):
         print(f"Controller: Input triggered - {binding.display_name}, is_recording={self.is_recording}")
         if not self.is_recording:
+            print("Controller: Starting recording due to input trigger")
             self.start_recording()
+        else:
+            print("Controller: Already recording, ignoring input trigger")
             
     def _on_idle_timeout(self):
         if self.is_recording:
