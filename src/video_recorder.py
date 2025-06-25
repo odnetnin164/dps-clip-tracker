@@ -23,6 +23,23 @@ class VideoRecorder:
             if not self.ffmpeg_path:
                 raise RuntimeError("FFmpeg is not available. Please install FFmpeg first.")
     
+    def _check_nvenc_support(self) -> bool:
+        """Check if NVENC encoder is available."""
+        try:
+            # Test if h264_nvenc encoder is available
+            test_cmd = [self.ffmpeg_path, "-hide_banner", "-encoders"]
+            result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=5)
+            
+            if result.returncode == 0 and "h264_nvenc" in result.stdout:
+                print("DEBUG: NVENC encoder detected")
+                return True
+            else:
+                print("DEBUG: NVENC encoder not available")
+                return False
+        except Exception as e:
+            print(f"DEBUG: Could not check NVENC support: {e}")
+            return False
+    
     def _get_focused_window_title(self) -> Optional[str]:
         """Get the title of the currently focused window."""
         system = platform.system()
@@ -123,16 +140,37 @@ class VideoRecorder:
         cmd = [self.ffmpeg_path, "-y"]  # -y to overwrite existing files
         
         if system == "Windows":
-            # Windows: Use gdigrab to capture window and dshow for audio
-            window_title = self._get_focused_window_title()
-            if window_title:
-                cmd.extend(["-f", "gdigrab", "-i", f"title={window_title}"])
-            else:
-                # Fallback to desktop capture
-                cmd.extend(["-f", "gdigrab", "-i", "desktop"])
+            # Windows: Use gdigrab for screen and dshow for audio (separate inputs)
+            cmd.extend(["-f", "gdigrab", "-i", "desktop"])
             
-            # Add audio input (default audio device)
-            cmd.extend(["-f", "dshow", "-i", "audio="])
+            # Look for Stereo Mix audio device and add as separate input
+            audio_found = False
+            try:
+                import sounddevice as sd
+                devices = sd.query_devices()
+                
+                print("DEBUG: All audio devices from sounddevice:")
+                for i, device in enumerate(devices):
+                    print(f"  {i}: {device['name']} (in: {device['max_input_channels']}, out: {device['max_output_channels']})")
+                
+                # Look for the specific Stereo Mix device
+                for device in devices:
+                    if 'Stereo Mix (Realtek(R) Audio)' in device['name']:
+                        cmd.extend(["-f", "dshow", "-i", f"audio=Stereo Mix (Realtek(R) Audio)"])
+                        audio_found = True
+                        print(f"DEBUG: Found and using: Stereo Mix (Realtek(R) Audio)")
+                        break
+                    elif 'stereo mix' in device['name'].lower():
+                        cmd.extend(["-f", "dshow", "-i", f"audio={device['name']}"])
+                        audio_found = True
+                        print(f"DEBUG: Found and using: {device['name']}")
+                        break
+                        
+            except Exception as e:
+                print(f"DEBUG: Could not detect audio devices: {e}")
+            
+            if not audio_found:
+                print("DEBUG: Recording video only - no Stereo Mix found")
             
         elif system == "Linux":
             # Linux: Use x11grab for screen and pulse/alsa for audio
@@ -153,16 +191,47 @@ class VideoRecorder:
             # macOS: Use avfoundation
             cmd.extend(["-f", "avfoundation", "-i", "1:0"])  # Screen:Audio
             
-        # Video and audio encoding options
-        cmd.extend([
-            "-c:v", "libx264",     # H.264 video codec
-            "-preset", "ultrafast", # Fast encoding
-            "-crf", "23",          # Good quality
-            "-r", str(self.fps),   # Frame rate
-            "-c:a", "aac",         # AAC audio codec
-            "-b:a", "128k",        # Audio bitrate
-            output_file
-        ])
+        # Video encoding options - try NVENC first, fallback to x264
+        nvenc_available = self._check_nvenc_support()
+        
+        if nvenc_available:
+            cmd.extend([
+                "-c:v", "h264_nvenc",  # NVIDIA hardware encoder
+                "-preset", "fast",     # NVENC preset
+                "-cq", "23",          # Constant quality (similar to CRF)
+                "-r", str(self.fps),   # Frame rate
+                "-pix_fmt", "yuv420p", # Pixel format
+            ])
+            print("DEBUG: Using NVENC hardware encoding")
+        else:
+            cmd.extend([
+                "-c:v", "libx264",     # H.264 software codec
+                "-preset", "ultrafast", # Fast encoding
+                "-crf", "23",          # Good quality
+                "-r", str(self.fps),   # Frame rate
+                "-pix_fmt", "yuv420p", # Pixel format compatible with most players
+            ])
+            print("DEBUG: Using x264 software encoding")
+        
+        # Audio encoding options (only if audio input was added)
+        # Check if any audio input was specified
+        has_audio = False
+        if system == "Windows":
+            has_audio = any("-f" in str(cmd[i]) and "dshow" in str(cmd[i+1]) for i in range(len(cmd)-1))
+        elif system == "Linux":
+            has_audio = any("-f" in str(cmd[i]) and "pulse" in str(cmd[i+1]) for i in range(len(cmd)-1))
+        elif system == "Darwin":
+            has_audio = True  # avfoundation includes audio
+        
+        if has_audio:
+            cmd.extend([
+                "-c:a", "aac",         # AAC audio codec
+                "-b:a", "128k",        # Audio bitrate
+            ])
+        
+        # Add MP4 optimization flags for better compatibility
+        cmd.extend(["-movflags", "faststart"])
+        cmd.append(output_file)
         
         return cmd
     
@@ -183,13 +252,15 @@ class VideoRecorder:
         print(f"DEBUG: Starting ffmpeg with command: {' '.join(cmd)}")
         
         try:
-            # Start ffmpeg process
+            # Start ffmpeg process with proper encoding handling
             self.ffmpeg_process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                encoding='utf-8',
+                errors='replace'  # Replace problematic characters instead of failing
             )
             
             # Give ffmpeg a moment to start
