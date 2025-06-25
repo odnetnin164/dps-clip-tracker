@@ -859,6 +859,9 @@ class MainWindow(QMainWindow):
         self.controller.recording_stopped.connect(self.on_recording_stopped)
         self.controller.status_changed.connect(self.on_status_changed)
         
+        # Check if FFmpeg installation is needed
+        self.check_ffmpeg_installation()
+        
     def connect_primary_player_signals(self):
         """Connect the primary media player signals to timeline and controls"""
         primary_player = self.video_grid.get_primary_player()
@@ -908,6 +911,60 @@ class MainWindow(QMainWindow):
             
     def on_status_changed(self, status: str):
         self.status_label.setText(status)
+        
+    def check_ffmpeg_installation(self):
+        """Check if FFmpeg installation is needed and prompt user."""
+        if not self.controller.is_ready_to_record():
+            reply = QMessageBox.question(
+                self,
+                "FFmpeg Required",
+                "FFmpeg is required for video recording but was not found on your system.\n\n"
+                "Would you like to download and install FFmpeg automatically?\n\n"
+                "This will download approximately 50-100MB depending on your platform.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self.install_ffmpeg()
+            else:
+                self.status_label.setText("FFmpeg installation declined - recording unavailable")
+                self.status_label.setStyleSheet("color: red; font-size: 12px; font-weight: bold;")
+    
+    def install_ffmpeg(self):
+        """Install FFmpeg with progress dialog."""
+        success = self.controller.install_ffmpeg_with_progress(self)
+        
+        if success:
+            self.status_label.setText("FFmpeg installed successfully - ready to record")
+            self.status_label.setStyleSheet("color: green; font-size: 12px; font-weight: bold;")
+            
+            # Show success message
+            QMessageBox.information(
+                self,
+                "Installation Complete",
+                "FFmpeg has been installed successfully!\n\n"
+                "You can now set up input bindings and start recording clips."
+            )
+        else:
+            self.status_label.setText("FFmpeg installation failed - recording unavailable")
+            self.status_label.setStyleSheet("color: red; font-size: 12px; font-weight: bold;")
+            
+            # Show error message with manual installation option
+            reply = QMessageBox.critical(
+                self,
+                "Installation Failed",
+                "FFmpeg installation failed. You can:\n\n"
+                "1. Try the installation again\n"
+                "2. Install FFmpeg manually and restart the application\n"
+                "3. Continue without recording functionality\n\n"
+                "Would you like to try installing again?",
+                QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Retry
+            )
+            
+            if reply == QMessageBox.StandardButton.Retry:
+                self.install_ffmpeg()
         
     def closeEvent(self, event):
         self.controller.cleanup()

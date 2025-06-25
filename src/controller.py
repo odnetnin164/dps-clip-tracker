@@ -2,20 +2,57 @@ from typing import Optional
 from PyQt6.QtCore import QObject, pyqtSignal
 from .video_recorder import VideoRecorder
 from .input_handler import InputHandler, InputBinding, InputType
+from .ffmpeg_installer import FFmpegInstaller
 
 
 class ClipRecorderController(QObject):
     recording_started = pyqtSignal()
     recording_stopped = pyqtSignal(str)
     status_changed = pyqtSignal(str)
+    ffmpeg_installation_required = pyqtSignal()
     
     def __init__(self):
         super().__init__()
-        self.video_recorder = VideoRecorder()
+        self.video_recorder = None
         self.input_handler = InputHandler()
         self.current_binding: Optional[InputBinding] = None
         self.is_recording = False
         self.is_monitoring = False
+        self.ffmpeg_path = None
+        
+        # Check if FFmpeg is available, but don't auto-install
+        if FFmpegInstaller.is_ffmpeg_available():
+            self._initialize_video_recorder()
+        else:
+            self.status_changed.emit("FFmpeg installation required")
+    
+    def _initialize_video_recorder(self):
+        """Initialize the video recorder using FFmpegInstaller."""
+        try:
+            ffmpeg_path = FFmpegInstaller.get_ffmpeg_path()
+            if not ffmpeg_path:
+                raise RuntimeError("FFmpeg not available")
+            
+            self.video_recorder = VideoRecorder(ffmpeg_path=ffmpeg_path)
+            self.ffmpeg_path = ffmpeg_path
+            self.status_changed.emit("Ready to record")
+        except Exception as e:
+            self.status_changed.emit(f"Error initializing recorder: {str(e)}")
+    
+    def install_ffmpeg_with_progress(self, parent_widget=None):
+        """Install FFmpeg with a progress dialog."""
+        from .ffmpeg_progress_dialog import FFmpegProgressDialog
+        
+        ffmpeg_path = FFmpegProgressDialog.install_ffmpeg_with_progress(parent_widget)
+        if ffmpeg_path:
+            # After successful installation, initialize the video recorder
+            self._initialize_video_recorder()
+            return True
+        return False
+    
+    def is_ready_to_record(self) -> bool:
+        """Check if the controller is ready to record."""
+        return self.video_recorder is not None
         
     def set_input_binding(self, binding: InputBinding):
         self.current_binding = binding
@@ -53,7 +90,7 @@ class ClipRecorderController(QObject):
             self.is_monitoring = False
             
     def start_recording(self):
-        if self.is_recording:
+        if self.is_recording or not self.video_recorder:
             return
             
         try:
@@ -65,7 +102,7 @@ class ClipRecorderController(QObject):
             self.status_changed.emit(f"Error starting recording: {str(e)}")
             
     def stop_recording(self):
-        if not self.is_recording:
+        if not self.is_recording or not self.video_recorder:
             return
             
         try:

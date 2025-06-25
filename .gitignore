@@ -187,3 +187,8 @@ recordings/
 *.avi
 *.mov
 *.mkv
+
+# FFmpeg binaries (downloaded automatically)
+ffmpeg/windows/
+ffmpeg/linux/
+ffmpeg/macos/
